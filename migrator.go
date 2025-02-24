@@ -1,9 +1,8 @@
-package postgres
+package duckdb
 
 import (
 	"database/sql"
 	"fmt"
-	"github.com/jackc/pgx/v5"
 	"regexp"
 	"strings"
 
@@ -17,49 +16,26 @@ import (
 // Here are some changes:
 // - use `LEFT JOIN` instead of `CROSS JOIN`
 // - exclude indexes used to support constraints (they are auto-generated)
+// DuckDBではインデックス情報を取得するためのシステムテーブルが異なります
 const indexSql = `
 SELECT
-	ct.relname AS table_name,
-	ci.relname AS index_name,
-	i.indisunique AS non_unique,
-	i.indisprimary AS primary,
-	a.attname AS column_name
-FROM
-	pg_index i
-	LEFT JOIN pg_class ct ON ct.oid = i.indrelid
-	LEFT JOIN pg_class ci ON ci.oid = i.indexrelid
-	LEFT JOIN pg_attribute a ON a.attrelid = ct.oid
-	LEFT JOIN pg_constraint con ON con.conindid = i.indexrelid
-WHERE
-	a.attnum = ANY(i.indkey)
-	AND con.oid IS NULL
-	AND ct.relkind = 'r'
-	AND ct.relname = ?
+    table_name,
+    index_name,
+    0 as non_unique,
+    0 as primary,
+    column_name
+FROM pragma_index_info(?)
 `
 
 var typeAliasMap = map[string][]string{
-	"int":                      {"integer"},
-	"int2":                     {"smallint"},
-	"int4":                     {"integer"},
-	"int8":                     {"bigint"},
-	"smallint":                 {"int2"},
-	"integer":                  {"int4"},
-	"bigint":                   {"int8"},
-	"decimal":                  {"numeric"},
-	"numeric":                  {"decimal"},
-	"timestamptz":              {"timestamp with time zone"},
-	"timestamp with time zone": {"timestamptz"},
-	"bool":                     {"boolean"},
-	"boolean":                  {"bool"},
-	"serial2":                  {"smallserial"},
-	"serial4":                  {"serial"},
-	"serial8":                  {"bigserial"},
-	"varbit":                   {"bit varying"},
-	"char":                     {"character"},
-	"varchar":                  {"character varying"},
-	"float4":                   {"real"},
-	"float8":                   {"double precision"},
-	"timetz":                   {"time with time zone"},
+	"int":      {"integer"},
+	"integer":  {"int"},
+	"bool":     {"boolean"},
+	"boolean":  {"bool"},
+	"varchar":  {"string", "text"},
+	"double":   {"float", "real"},
+	"blob":     {"binary"},
+	"datetime": {"timestamp"},
 }
 
 type Migrator struct {
@@ -108,9 +84,9 @@ func (m Migrator) HasIndex(value interface{}, name string) bool {
 				name = idx.Name
 			}
 		}
-		currentSchema, curTable := m.CurrentSchema(stmt, stmt.Table)
 		return m.queryRaw(
-			"SELECT count(*) FROM pg_indexes WHERE tablename = ? AND indexname = ? AND schemaname = ?", curTable, name, currentSchema,
+			"SELECT COUNT(*) FROM pragma_index_list(?) WHERE name = ?",
+			m.CurrentTable(stmt), name,
 		).Scan(&count).Error
 	})
 
@@ -180,24 +156,31 @@ func (m Migrator) DropIndex(value interface{}, name string) error {
 }
 
 func (m Migrator) GetTables() (tableList []string, err error) {
-	currentSchema, _ := m.CurrentSchema(m.DB.Statement, "")
-	return tableList, m.queryRaw("SELECT table_name FROM information_schema.tables WHERE table_schema = ? AND table_type = ?", currentSchema, "BASE TABLE").Scan(&tableList).Error
+	return tableList, m.queryRaw("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").Scan(&tableList).Error
 }
 
 func (m Migrator) CreateTable(values ...interface{}) (err error) {
+	// First create tables without sequences
 	if err = m.Migrator.CreateTable(values...); err != nil {
 		return
 	}
+
+	// Then add sequences and update default values
 	for _, value := range m.ReorderModels(values, false) {
 		if err = m.RunWithValue(value, func(stmt *gorm.Statement) error {
 			if stmt.Schema != nil {
-				for _, fieldName := range stmt.Schema.DBNames {
-					field := stmt.Schema.FieldsByDBName[fieldName]
-					if field.Comment != "" {
-						if err := m.DB.Exec(
-							"COMMENT ON COLUMN ?.? IS ?",
-							m.CurrentTable(stmt), clause.Column{Name: field.DBName}, gorm.Expr(m.Migrator.Dialector.Explain("$1", field.Comment)),
-						).Error; err != nil {
+				for _, field := range stmt.Schema.Fields {
+					if field.Name == "ID" && field.AutoIncrement {
+						tableName := stmt.Table
+						seqName := tableName + "_seq"
+						
+						// Create sequence
+						if err := m.DB.Exec("CREATE SEQUENCE IF NOT EXISTS " + seqName + " START 1").Error; err != nil {
+							return err
+						}
+
+						// Alter column to use sequence
+						if err := m.DB.Exec("ALTER TABLE " + tableName + " ALTER COLUMN " + field.DBName + " SET DEFAULT nextval('" + seqName + "')").Error; err != nil {
 							return err
 						}
 					}
@@ -208,15 +191,20 @@ func (m Migrator) CreateTable(values ...interface{}) (err error) {
 			return
 		}
 	}
-	return
+
+	return nil
 }
 
 func (m Migrator) HasTable(value interface{}) bool {
 	var count int64
 	m.RunWithValue(value, func(stmt *gorm.Statement) error {
-		currentSchema, curTable := m.CurrentSchema(stmt, stmt.Table)
-		return m.queryRaw("SELECT count(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ? AND table_type = ?", currentSchema, curTable, "BASE TABLE").Scan(&count).Error
+		currentDatabase := m.DB.Migrator().CurrentDatabase()
+		return m.DB.Raw(
+			"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
+			currentDatabase, stmt.Table,
+		).Scan(&count).Error
 	})
+
 	return count > 0
 }
 
@@ -266,10 +254,9 @@ func (m Migrator) HasColumn(value interface{}, field string) bool {
 			}
 		}
 
-		currentSchema, curTable := m.CurrentSchema(stmt, stmt.Table)
 		return m.queryRaw(
-			"SELECT count(*) FROM INFORMATION_SCHEMA.columns WHERE table_schema = ? AND table_name = ? AND column_name = ?",
-			currentSchema, curTable, name,
+			"SELECT count(*) FROM pragma_table_info(?) WHERE name = ?",
+			m.CurrentTable(stmt), name,
 		).Scan(&count).Error
 	})
 
@@ -277,35 +264,13 @@ func (m Migrator) HasColumn(value interface{}, field string) bool {
 }
 
 func (m Migrator) MigrateColumn(value interface{}, field *schema.Field, columnType gorm.ColumnType) error {
-	// skip primary field
 	if !field.PrimaryKey {
 		if err := m.Migrator.MigrateColumn(value, field, columnType); err != nil {
 			return err
 		}
 	}
-
-	return m.RunWithValue(value, func(stmt *gorm.Statement) error {
-		var description string
-		currentSchema, curTable := m.CurrentSchema(stmt, stmt.Table)
-		values := []interface{}{currentSchema, curTable, field.DBName, stmt.Table, currentSchema}
-		checkSQL := "SELECT description FROM pg_catalog.pg_description "
-		checkSQL += "WHERE objsubid = (SELECT ordinal_position FROM information_schema.columns WHERE table_schema = ? AND table_name = ? AND column_name = ?) "
-		checkSQL += "AND objoid = (SELECT oid FROM pg_catalog.pg_class WHERE relname = ? AND relnamespace = "
-		checkSQL += "(SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = ?))"
-		m.queryRaw(checkSQL, values...).Scan(&description)
-
-		comment := strings.Trim(field.Comment, "'")
-		comment = strings.Trim(comment, `"`)
-		if field.Comment != "" && comment != description {
-			if err := m.DB.Exec(
-				"COMMENT ON COLUMN ?.? IS ?",
-				m.CurrentTable(stmt), clause.Column{Name: field.DBName}, gorm.Expr(m.Migrator.Dialector.Explain("$1", field.Comment)),
-			).Error; err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	// DuckDBではコメントはサポートされていないため、コメント関連の処理は不要
+	return nil
 }
 
 // AlterColumn alter value's `field` column' type based on schema definition
@@ -381,7 +346,10 @@ func (m Migrator) AlterColumn(value interface{}, field string) error {
 						if field.DefaultValueInterface != nil {
 							defaultStmt := &gorm.Statement{Vars: []interface{}{field.DefaultValueInterface}}
 							m.Dialector.BindVarTo(defaultStmt, defaultStmt, field.DefaultValueInterface)
-							if err := m.DB.Exec("ALTER TABLE ? ALTER COLUMN ? SET DEFAULT ?", m.CurrentTable(stmt), clause.Column{Name: field.DBName}, clause.Expr{SQL: m.Dialector.Explain(defaultStmt.SQL.String(), field.DefaultValueInterface)}).Error; err != nil {
+							if err := m.DB.Exec(
+								"ALTER TABLE ? ALTER COLUMN ? SET DEFAULT ?",
+								m.CurrentTable(stmt), clause.Column{Name: field.DBName}, clause.Expr{SQL: m.Dialector.Explain(defaultStmt.SQL.String(), field.DefaultValueInterface)},
+							).Error; err != nil {
 								return err
 							}
 						} else if field.DefaultValue != "(-)" {
@@ -458,13 +426,10 @@ func (m Migrator) HasConstraint(value interface{}, name string) bool {
 func (m Migrator) ColumnTypes(value interface{}) (columnTypes []gorm.ColumnType, err error) {
 	columnTypes = make([]gorm.ColumnType, 0)
 	err = m.RunWithValue(value, func(stmt *gorm.Statement) error {
-		var (
-			currentDatabase      = m.DB.Migrator().CurrentDatabase()
-			currentSchema, table = m.CurrentSchema(stmt, stmt.Table)
-			columns, err         = m.queryRaw(
-				"SELECT c.column_name, c.is_nullable = 'YES', c.udt_name, c.character_maximum_length, c.numeric_precision, c.numeric_precision_radix, c.numeric_scale, c.datetime_precision, 8 * typlen, c.column_default, pd.description, c.identity_increment FROM information_schema.columns AS c JOIN pg_type AS pgt ON c.udt_name = pgt.typname LEFT JOIN pg_catalog.pg_description as pd ON pd.objsubid = c.ordinal_position AND pd.objoid = (SELECT oid FROM pg_catalog.pg_class WHERE relname = c.table_name AND relnamespace = (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = c.table_schema)) where table_catalog = ? AND table_schema = ? AND table_name = ?",
-				currentDatabase, currentSchema, table).Rows()
-		)
+		var columns *sql.Rows
+		columns, err = m.queryRaw(
+			"SELECT name, type, notnull, dflt_value FROM pragma_table_info(?)",
+			m.CurrentTable(stmt)).Rows()
 
 		if err != nil {
 			return err
@@ -472,138 +437,70 @@ func (m Migrator) ColumnTypes(value interface{}) (columnTypes []gorm.ColumnType,
 
 		for columns.Next() {
 			var (
-				column = &migrator.ColumnType{
-					PrimaryKeyValue: sql.NullBool{Valid: true},
-					UniqueValue:     sql.NullBool{Valid: true},
-				}
-				datetimePrecision sql.NullInt64
-				radixValue        sql.NullInt64
-				typeLenValue      sql.NullInt64
-				identityIncrement sql.NullString
+				name         string
+				typeName     string
+				notNull      bool
+				defaultValue sql.NullString
 			)
 
-			err = columns.Scan(
-				&column.NameValue, &column.NullableValue, &column.DataTypeValue, &column.LengthValue, &column.DecimalSizeValue,
-				&radixValue, &column.ScaleValue, &datetimePrecision, &typeLenValue, &column.DefaultValueValue, &column.CommentValue, &identityIncrement,
-			)
-			if err != nil {
+			if err := columns.Scan(&name, &typeName, &notNull, &defaultValue); err != nil {
 				return err
 			}
 
-			if typeLenValue.Valid && typeLenValue.Int64 > 0 {
-				column.LengthValue = typeLenValue
-			}
-
-			if (strings.HasPrefix(column.DefaultValueValue.String, "nextval('") &&
-				strings.HasSuffix(column.DefaultValueValue.String, "seq'::regclass)")) || (identityIncrement.Valid && identityIncrement.String != "") {
-				column.AutoIncrementValue = sql.NullBool{Bool: true, Valid: true}
-				column.DefaultValueValue = sql.NullString{}
-			}
-
-			if column.DefaultValueValue.Valid {
-				column.DefaultValueValue.String = parseDefaultValueValue(column.DefaultValueValue.String)
-			}
-
-			if datetimePrecision.Valid {
-				column.DecimalSizeValue = datetimePrecision
+			column := &migrator.ColumnType{
+				NameValue:         sql.NullString{String: name, Valid: true},
+				DataTypeValue:     sql.NullString{String: typeName, Valid: true},
+				ColumnTypeValue:   sql.NullString{String: typeName, Valid: true},
+				NullableValue:     sql.NullBool{Bool: !notNull, Valid: true},
+				DefaultValueValue: defaultValue,
+				PrimaryKeyValue:   sql.NullBool{Valid: true},
+				UniqueValue:       sql.NullBool{Valid: true},
 			}
 
 			columnTypes = append(columnTypes, column)
 		}
 		columns.Close()
 
-		// assign sql column type
-		{
-			rows, rowsErr := m.GetRows(currentSchema, table)
-			if rowsErr != nil {
-				return rowsErr
-			}
-			rawColumnTypes, err := rows.ColumnTypes()
-			if err != nil {
+		// Get primary key and unique constraints
+		pkRows, err := m.queryRaw("SELECT name FROM pragma_table_info(?) WHERE pk > 0", m.CurrentTable(stmt)).Rows()
+		if err != nil {
+			return err
+		}
+		for pkRows.Next() {
+			var name string
+			if err := pkRows.Scan(&name); err != nil {
 				return err
 			}
-			for _, columnType := range columnTypes {
-				for _, c := range rawColumnTypes {
-					if c.Name() == columnType.Name() {
-						columnType.(*migrator.ColumnType).SQLColumnType = c
-						break
-					}
+			for _, c := range columnTypes {
+				mc := c.(*migrator.ColumnType)
+				if mc.NameValue.String == name {
+					mc.PrimaryKeyValue = sql.NullBool{Bool: true, Valid: true}
+					break
 				}
 			}
-			rows.Close()
 		}
+		pkRows.Close()
 
-		// check primary, unique field
-		{
-			columnTypeRows, err := m.queryRaw("SELECT constraint_name FROM information_schema.table_constraints tc JOIN information_schema.constraint_column_usage AS ccu USING (constraint_schema, constraint_catalog, table_name, constraint_name) JOIN information_schema.columns AS c ON c.table_schema = tc.constraint_schema AND tc.table_name = c.table_name AND ccu.column_name = c.column_name WHERE constraint_type IN ('PRIMARY KEY', 'UNIQUE') AND c.table_catalog = ? AND c.table_schema = ? AND c.table_name = ? AND constraint_type = ?", currentDatabase, currentSchema, table, "UNIQUE").Rows()
-			if err != nil {
-				return err
-			}
-			uniqueContraints := map[string]int{}
-			for columnTypeRows.Next() {
-				var constraintName string
-				columnTypeRows.Scan(&constraintName)
-				uniqueContraints[constraintName]++
-			}
-			columnTypeRows.Close()
-
-			columnTypeRows, err = m.queryRaw("SELECT c.column_name, constraint_name, constraint_type FROM information_schema.table_constraints tc JOIN information_schema.constraint_column_usage AS ccu USING (constraint_schema, constraint_catalog, table_name, constraint_name) JOIN information_schema.columns AS c ON c.table_schema = tc.constraint_schema AND tc.table_name = c.table_name AND ccu.column_name = c.column_name WHERE constraint_type IN ('PRIMARY KEY', 'UNIQUE') AND c.table_catalog = ? AND c.table_schema = ? AND c.table_name = ?", currentDatabase, currentSchema, table).Rows()
-			if err != nil {
-				return err
-			}
-			for columnTypeRows.Next() {
-				var name, constraintName, columnType string
-				columnTypeRows.Scan(&name, &constraintName, &columnType)
-				for _, c := range columnTypes {
-					mc := c.(*migrator.ColumnType)
-					if mc.NameValue.String == name {
-						switch columnType {
-						case "PRIMARY KEY":
-							mc.PrimaryKeyValue = sql.NullBool{Bool: true, Valid: true}
-						case "UNIQUE":
-							if uniqueContraints[constraintName] == 1 {
-								mc.UniqueValue = sql.NullBool{Bool: true, Valid: true}
-							}
-						}
-						break
-					}
+		// assign sql column type using current connection
+		rows, err := m.DB.Session(&gorm.Session{}).Table(stmt.Table).Limit(1).Rows()
+		if err != nil {
+			return err
+		}
+		rawColumnTypes, err := rows.ColumnTypes()
+		if err != nil {
+			return err
+		}
+		for _, columnType := range columnTypes {
+			for _, c := range rawColumnTypes {
+				if c.Name() == columnType.Name() {
+					columnType.(*migrator.ColumnType).SQLColumnType = c
+					break
 				}
 			}
-			columnTypeRows.Close()
 		}
+		rows.Close()
 
-		// check column type
-		{
-			dataTypeRows, err := m.queryRaw(`SELECT a.attname as column_name, format_type(a.atttypid, a.atttypmod) AS data_type
-		FROM pg_attribute a JOIN pg_class b ON a.attrelid = b.oid AND relnamespace = (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = ?)
-		WHERE a.attnum > 0 -- hide internal columns
-		AND NOT a.attisdropped -- hide deleted columns
-		AND b.relname = ?`, currentSchema, table).Rows()
-			if err != nil {
-				return err
-			}
-
-			for dataTypeRows.Next() {
-				var name, dataType string
-				dataTypeRows.Scan(&name, &dataType)
-				for _, c := range columnTypes {
-					mc := c.(*migrator.ColumnType)
-					if mc.NameValue.String == name {
-						mc.ColumnTypeValue = sql.NullString{String: dataType, Valid: true}
-						// Handle array type: _text -> text[] , _int4 -> integer[]
-						// Not support array size limits and array size limits because:
-						// https://www.postgresql.org/docs/current/arrays.html#ARRAYS-DECLARATION
-						if strings.HasPrefix(mc.DataTypeValue.String, "_") {
-							mc.DataTypeValue = sql.NullString{String: dataType, Valid: true}
-						}
-						break
-					}
-				}
-			}
-			dataTypeRows.Close()
-		}
-
-		return err
+		return nil
 	})
 	return
 }
@@ -615,11 +512,6 @@ func (m Migrator) GetRows(currentSchema interface{}, table interface{}) (*sql.Ro
 	}
 
 	return m.DB.Session(&gorm.Session{}).Table(name).Limit(1).Scopes(func(d *gorm.DB) *gorm.DB {
-		dialector, _ := m.Dialector.(Dialector)
-		// use simple protocol
-		if !m.DB.PrepareStmt && (dialector.Config != nil && (dialector.Config.DriverName == "" || dialector.Config.DriverName == "pgx")) {
-			d.Statement.Vars = append([]interface{}{pgx.QueryExecModeSimpleProtocol}, d.Statement.Vars...)
-		}
 		return d
 	}).Rows()
 }
@@ -641,69 +533,25 @@ func (m Migrator) CurrentSchema(stmt *gorm.Statement, table string) (interface{}
 
 func (m Migrator) CreateSequence(tx *gorm.DB, stmt *gorm.Statement, field *schema.Field,
 	serialDatabaseType string) (err error) {
-
-	_, table := m.CurrentSchema(stmt, stmt.Table)
-	tableName := table.(string)
-
-	sequenceName := strings.Join([]string{tableName, field.DBName, "seq"}, "_")
-	if err = tx.Exec(`CREATE SEQUENCE IF NOT EXISTS ? AS ?`, clause.Expr{SQL: sequenceName},
-		clause.Expr{SQL: serialDatabaseType}).Error; err != nil {
-		return err
-	}
-
-	if err := tx.Exec("ALTER TABLE ? ALTER COLUMN ? SET DEFAULT nextval('?')",
-		clause.Expr{SQL: tableName}, clause.Expr{SQL: field.DBName}, clause.Expr{SQL: sequenceName}).Error; err != nil {
-		return err
-	}
-
-	if err := tx.Exec("ALTER SEQUENCE ? OWNED BY ?.?",
-		clause.Expr{SQL: sequenceName}, clause.Expr{SQL: tableName}, clause.Expr{SQL: field.DBName}).Error; err != nil {
-		return err
-	}
-	return
+	// DuckDBではAUTOINCREMENTを使用
+	return tx.Exec("ALTER TABLE ? MODIFY COLUMN ? ? AUTOINCREMENT",
+		m.CurrentTable(stmt), clause.Column{Name: field.DBName},
+		clause.Expr{SQL: serialDatabaseType}).Error
 }
 
 func (m Migrator) UpdateSequence(tx *gorm.DB, stmt *gorm.Statement, field *schema.Field,
 	serialDatabaseType string) (err error) {
-
-	sequenceName, err := m.getColumnSequenceName(tx, stmt, field)
-	if err != nil {
-		return err
-	}
-
-	if err = tx.Exec(`ALTER SEQUENCE IF EXISTS ? AS ?`, clause.Expr{SQL: sequenceName}, clause.Expr{SQL: serialDatabaseType}).Error; err != nil {
-		return err
-	}
-
-	if err := tx.Exec("ALTER TABLE ? ALTER COLUMN ? TYPE ?",
-		m.CurrentTable(stmt), clause.Expr{SQL: field.DBName}, clause.Expr{SQL: serialDatabaseType}).Error; err != nil {
-		return err
-	}
-	return
+	// DuckDBではAUTOINCREMENTの変更は新しいカラムの作成と古いカラムの削除が必要
+	return tx.Exec("ALTER TABLE ? MODIFY COLUMN ? ? AUTOINCREMENT",
+		m.CurrentTable(stmt), clause.Column{Name: field.DBName},
+		clause.Expr{SQL: serialDatabaseType}).Error
 }
 
 func (m Migrator) DeleteSequence(tx *gorm.DB, stmt *gorm.Statement, field *schema.Field,
 	fileType clause.Expr) (err error) {
-
-	sequenceName, err := m.getColumnSequenceName(tx, stmt, field)
-	if err != nil {
-		return err
-	}
-
-	if err := tx.Exec("ALTER TABLE ? ALTER COLUMN ? TYPE ?", m.CurrentTable(stmt), clause.Column{Name: field.DBName}, fileType).Error; err != nil {
-		return err
-	}
-
-	if err := tx.Exec("ALTER TABLE ? ALTER COLUMN ? DROP DEFAULT",
-		m.CurrentTable(stmt), clause.Expr{SQL: field.DBName}).Error; err != nil {
-		return err
-	}
-
-	if err = tx.Exec(`DROP SEQUENCE IF EXISTS ?`, clause.Expr{SQL: sequenceName}).Error; err != nil {
-		return err
-	}
-
-	return
+	// DuckDBではAUTOINCREMENTを通常のカラムに変更
+	return tx.Exec("ALTER TABLE ? MODIFY COLUMN ? ?",
+		m.CurrentTable(stmt), clause.Column{Name: field.DBName}, fileType).Error
 }
 
 func (m Migrator) getColumnSequenceName(tx *gorm.DB, stmt *gorm.Statement, field *schema.Field) (
@@ -775,6 +623,18 @@ func groupByIndexName(indexList []*Index) map[string][]*Index {
 		columnIndexMap[idx.IndexName] = append(columnIndexMap[idx.IndexName], idx)
 	}
 	return columnIndexMap
+}
+
+func getSerialDatabaseType(columnType string) (string, error) {
+	switch columnType {
+	case "smallserial", "serial2":
+		return "smallint", nil
+	case "serial", "serial4":
+		return "integer", nil
+	case "bigserial", "serial8":
+		return "bigint", nil
+	}
+	return "", fmt.Errorf("invalid serial type: %s", columnType)
 }
 
 func (m Migrator) GetTypeAliases(databaseTypeName string) []string {
